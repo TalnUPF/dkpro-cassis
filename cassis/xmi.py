@@ -1,6 +1,7 @@
 from collections import defaultdict
 from io import BytesIO
 from typing import IO, Union, List
+import re
 
 import attr
 
@@ -53,31 +54,75 @@ class CasXmiDeserializer:
         views = {}
         annotations = {}
 
-        context = etree.iterparse(source, events=("end",))
-
+        depth = 0
+        context = etree.iterparse(source, events=("end","start"))
         for event, elem in context:
-            assert event == "end"
+            #assert event == "end"
 
-            if elem.tag == TAG_XMI:
-                # Ignore the closing 'xmi:XMI' tag
-                pass
-            elif elem.tag == TAG_CAS_NULL:
-                pass
-            elif elem.tag == TAG_CAS_SOFA:
-                sofa = self._parse_sofa(elem)
-                sofas.append(sofa)
-            elif elem.tag == TAG_CAS_VIEW:
-                proto_view = self._parse_view(elem)
-                views[proto_view.sofa] = proto_view
+            if event == "start":
+                depth += 1
+
+                if elem.tag == TAG_XMI:
+                    # Ignore the closing 'xmi:XMI' tag
+                    pass
+                elif elem.tag == TAG_CAS_NULL:
+                    pass
+                elif elem.tag == TAG_CAS_SOFA:
+                    sofa = self._parse_sofa(elem)
+                    sofas.append(sofa)
+                elif elem.tag == TAG_CAS_VIEW:
+                    proto_view = self._parse_view(elem)
+                    views[proto_view.sofa] = proto_view
+                else:
+                    if depth == 2:
+                        annotation = self._parse_annotation(typesystem, elem)
+                        annotations[annotation.xmiID] = annotation
+
+                    else:
+                        pass
+
+            elif event == "end":
+                depth -= 1
+                # Free already processed elements from memory
+                self._clear_elem(elem)
+
             else:
-                annotation = self._parse_annotation(typesystem, elem)
-                annotations[annotation.xmiID] = annotation
-
-            # Free already processed elements from memory
-            self._clear_elem(elem)
+                raise RuntimeError("Invalid parsing event '%s'!" % event)
 
         if len(sofas) != len(views):
             raise RuntimeError("Number of views and sofas is not equal!")
+
+        for annotation in annotations.values():
+            ann_type = typesystem.get_type(annotation.type)
+
+            all_features = {}
+            all_features.update(ann_type._inherited_features)
+            all_features.update(ann_type._features)
+
+            for attribute in annotation.__slots__:
+                feature = all_features.get(attribute)
+
+                if feature:
+                    feat_type = typesystem.get_type(feature.rangeTypeName)
+
+                    if feat_type.name == 'uima.tcas.Annotation' or feat_type.supertypeName == 'uima.tcas.Annotation':
+                        feat_xml_id = annotation.__getattribute__(attribute)
+
+                        if feat_xml_id:
+                            feat_ann = annotations.get(int(feat_xml_id))
+
+                            if feat_ann:
+
+                                feat_ancestors = [feat_type.name]
+                                while feat_ancestors:
+                                    feat_ancestor = feat_ancestors.pop(0)
+
+                                    if feat_ann.type == feat_ancestor:
+                                        annotation.__setattr__(attribute, feat_ann)
+                                        feat_ancestors.clear()
+
+                                    else:
+                                        feat_ancestors.extend(typesystem.get_type(feat_ancestor)._children)
 
         cas = Cas()
         for sofa in sofas:
@@ -115,7 +160,11 @@ class CasXmiDeserializer:
     def _parse_annotation(self, typesystem: TypeSystem, elem):
         # Strip the http prefix, replace / with ., remove the ecore part
         # TODO: Error checking
-        typename = elem.tag[9:].replace("/", ".").replace("ecore}", "")
+
+        typename = elem.tag
+        if typename.startswith("{"):
+            parts = re.findall("(?:/|})([^}/.]+)", typename)
+            typename = ".".join(parts)
 
         AnnotationType = typesystem.get_type(typename)
         attributes = dict(elem.attrib)
